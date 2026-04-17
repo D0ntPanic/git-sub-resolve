@@ -8,49 +8,68 @@ superproject just needs its gitlink pointed at the right commit.
 
 When you rebase or merge at the superproject and a submodule's pointer differs
 between the two sides, git leaves the gitlink in a conflicted state with three
-index stages: `base` (stage 1), `ours` (stage 2), `theirs` (stage 3). Git will
-not look inside the submodule to resolve this for you. If you've already
-reconciled the submodule's own branch (by cherry-picking, rebasing, or merging
-`theirs` into `ours` inside the submodule), the fix at the superproject is
-mechanical: find the commit in the submodule that represents that
-reconciliation, and stage it. This tool automates that step.
+index stages: `ancestor` (stage 1), `ours` (stage 2), `theirs` (stage 3). Git
+will not look inside the submodule to resolve this for you. If you've already
+reconciled the submodule's own branch (by rebasing the incoming commits on top
+of the current ours state), the fix at the superproject is mechanical: find
+the commit in the submodule that represents that reconciliation, and stage it.
+This tool automates that step.
 
 ## How it works
 
+The assumed workflow: you first rebase the submodule so its branch contains
+upstream's work with your feature work replayed on top, then you rebase (or
+merge) the superproject. The submodule branch's tip — or some interior commit
+in that replayed chain — is the commit the superproject's gitlink should end
+up pointing at.
+
 Given a submodule path that has a gitlink conflict, the tool:
 
-1. Reads the three conflict stages from the superproject index.
-2. Reads the commit message of the `theirs` commit — this is the message the
-   reconciliation commit will share, on the assumption that the submodule side
-   was reconciled by cherry-pick / rebase / equivalent (which preserves the
-   original commit message).
-3. Walks every `refs/heads/*` and `refs/remotes/*` in the submodule, plus HEAD,
-   hiding anything reachable from `ours` or `theirs`. What remains is exactly
-   the commits introduced to reconcile the two sides.
-4. Filters the matches to those whose ancestry contains `ours` — a genuine
-   reconciliation is `theirs` applied on top of `ours`, so `ours` must be an
-   ancestor. Copies on unrelated branches (backports, stale rebases) are
-   discarded.
-5. If exactly one commit remains, the tool:
+1. Reads the three conflict stages from the superproject index: `ancestor`
+   (stage 1), `ours` (stage 2), `theirs` (stage 3).
+2. Computes the **incoming fingerprint**: the multiset of commit messages
+   reachable from `theirs` but not from `ancestor` in the submodule DAG. This
+   is exactly the submodule change described by the diff of the superproject
+   commit being applied — the set of submodule commits that commit wants to
+   bring in.
+3. Walks every `refs/heads/*` and `refs/remotes/*` in the submodule, plus
+   HEAD, hiding `ours` and its ancestors. Each visited commit is a candidate
+   X that lives on top of `ours`.
+4. For each candidate, compares the multiset of commit messages in `ours..X`
+   against the incoming fingerprint. A match means X is `ours` with exactly
+   the incoming commits replayed on top — which is the submodule state you
+   produced by rebasing the submodule first.
+5. Cheap pre-filter: candidates whose own commit message isn't in the
+   fingerprint are skipped without the full revwalk.
+6. If exactly one commit matches, the tool:
    - Checks out the submodule's working tree at that commit (safe checkout;
      aborts if the working tree has uncommitted changes), leaving HEAD
      detached, so the UI shows the submodule clean.
-   - Stages the gitlink at that commit in the superproject index, clearing all
-     three conflict stages.
+   - Stages the gitlink at that commit in the superproject index, clearing
+     all three conflict stages.
 
-If zero or multiple commits survive the filter, the tool prints a diagnostic
-and exits without touching either the submodule working tree or the
-superproject index.
+The full message list is a much stronger fingerprint than a single commit
+message, so this survives large repos with many backports and overlapping
+feature branches — two unrelated branches rarely share an entire sequence of
+commit messages.
+
+If zero or multiple commits match, the tool prints a diagnostic and exits
+without touching either the submodule working tree or the superproject index.
+
+Edge case: if `theirs == ancestor` (the incoming commit doesn't change the
+submodule ref), the fingerprint is empty and the tool stages `ours`. Git
+shouldn't produce this as a conflict in practice, but it's handled cleanly.
 
 ## What it won't do
 
 - By default it does not continue the rebase or merge. After the gitlink is
   staged you can review with `git diff --cached -- <path>` and then continue on
   your own. (See `--all` below for opt-in auto-continuation.)
-- It does not handle reconciliations done via a real merge commit in the
-  submodule (where the merge commit has a `Merge branch...` message rather
-  than the incoming commit's message). Only cherry-pick / rebase style
-  reconciliations are detected.
+- It does not handle reconciliations that rewrite commit messages (e.g. a
+  true submodule merge commit whose message is `Merge branch...` rather than
+  one of the incoming commits, or a squash that collapses the chain). The
+  fingerprint relies on messages being preserved through the replay, which
+  is what cherry-pick / rebase do by default.
 - It does not read `.gitmodules` `branch`. That field is author-intent and is
   frequently wrong on feature branches where both the superproject and
   submodule are on alternate branches.
@@ -115,6 +134,10 @@ Preconditions and guarantees:
 - The continuation step shells out to `git <op> --continue` with
   `GIT_EDITOR=true` so no editor is opened for the commit message. The merge
   commit message is whatever git would have produced non-interactively.
+- On successful completion, each touched submodule is checked: if its
+  detached HEAD points exactly at the tip of a single local branch, HEAD is
+  re-attached to that branch as a cosmetic cleanup. Submodules with multiple
+  branches at the same commit, or none, are left detached.
 
 Example output for a rebase with two conflicting commits, each of which touches
 the same submodule:
@@ -146,13 +169,13 @@ unique resolution. Common diagnostics:
 - `no submodule registered at '<path>'` — typo or wrong path.
 - `submodule '<path>' is missing the <base|ours|theirs> commit` — fetch inside
   the submodule and retry.
-- `no commit introduced between 'ours' and any submodule ref carries the
-  incoming commit message` — the submodule side hasn't been reconciled yet;
-  merge/cherry-pick `theirs` into the appropriate branch first.
-- `found N commit(s) ... but none descend from 'ours'` — matches exist on
-  unrelated branches only (backports, stale rebases); no valid resolution.
-- `ambiguous match: multiple submodule commits descend from 'ours'` — more
-  than one candidate; resolve manually.
+- `no submodule commit descends from ours ... whose history since ours matches
+  the N commit message(s) the incoming commit introduces` — the submodule
+  hasn't been rebased to put the incoming commits on top of ours yet; rebase
+  the submodule first and retry.
+- `ambiguous match: multiple submodule commits descend from ours ... and carry
+  the same commit-message list as the incoming diff` — more than one candidate
+  has an identical message sequence; resolve manually.
 - `could not update submodule working tree ... 1 conflict prevents checkout`
   — submodule has uncommitted changes; commit or stash them and retry. The
   superproject index is left untouched in this case.

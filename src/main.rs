@@ -101,6 +101,7 @@ fn run_all() -> Result<()> {
         bail!("no merge/rebase/cherry-pick in progress");
     }
 
+    let mut touched: HashSet<String> = HashSet::new();
     let mut iteration = 0;
     loop {
         iteration += 1;
@@ -128,6 +129,7 @@ fn run_all() -> Result<()> {
                     short_oid(outcome.staged),
                     short_oid(outcome.theirs_oid),
                 );
+                touched.insert(path.clone());
             }
 
             let mut fresh = super_repo
@@ -146,8 +148,7 @@ fn run_all() -> Result<()> {
 
         let state = super_repo.state();
         if state == RepositoryState::Clean {
-            println!("Merge complete.");
-            return Ok(());
+            return finalize_all(&super_repo, &touched);
         }
 
         let op = state_to_op(state)?;
@@ -155,10 +156,84 @@ fn run_all() -> Result<()> {
         continue_operation(&super_repo, op)?;
 
         if super_repo.state() == RepositoryState::Clean {
-            println!("Merge complete.");
-            return Ok(());
+            return finalize_all(&super_repo, &touched);
         }
     }
+}
+
+fn finalize_all(super_repo: &Repository, touched: &HashSet<String>) -> Result<()> {
+    println!("Merge complete.");
+    if !touched.is_empty() {
+        reattach_submodule_heads(super_repo, touched);
+    }
+    Ok(())
+}
+
+/// For each submodule we touched, if HEAD is detached and *exactly one* local
+/// branch has its tip at that commit, move HEAD onto that branch. This is a
+/// cosmetic cleanup — `checkout_submodule` always detaches, but in practice
+/// the resolved commit is usually the tip of the branch the user was working
+/// on in the submodule, so re-attaching matches their mental model.
+///
+/// Silent on failure: any error here is non-fatal (the merge already
+/// finished), so we only log successful re-attaches.
+fn reattach_submodule_heads(super_repo: &Repository, paths: &HashSet<String>) {
+    let mut sorted: Vec<&String> = paths.iter().collect();
+    sorted.sort();
+    for path in sorted {
+        let sub_repo = match super_repo
+            .find_submodule(path)
+            .and_then(|sm| sm.open())
+        {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        let head = match sub_repo.head() {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        if head.is_branch() {
+            continue;
+        }
+        let head_oid = match head.peel_to_commit() {
+            Ok(c) => c.id(),
+            Err(_) => continue,
+        };
+
+        let branches = local_branches_at(&sub_repo, head_oid);
+        let branch = match branches.as_slice() {
+            [only] => only,
+            _ => continue,
+        };
+
+        let full_ref = format!("refs/heads/{branch}");
+        if sub_repo.set_head(&full_ref).is_ok() {
+            println!("  {path}: attached HEAD to {branch}");
+        }
+    }
+}
+
+/// Local branch short names whose tip is exactly `target`.
+fn local_branches_at(sub_repo: &Repository, target: Oid) -> Vec<String> {
+    let mut names = Vec::new();
+    let refs = match sub_repo.references() {
+        Ok(r) => r,
+        Err(_) => return names,
+    };
+    for r in refs.flatten() {
+        let Some(name) = r.name() else { continue };
+        let Some(short) = name.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        if let Ok(commit) = r.peel_to_commit() {
+            if commit.id() == target {
+                names.push(short.to_string());
+            }
+        }
+    }
+    names.sort();
+    names
 }
 
 struct ResolutionOutcome {
@@ -199,14 +274,8 @@ fn resolve_submodule(super_repo: &Repository, submodule_path: &str) -> Result<Re
             )
         })?;
 
-    let theirs_commit = sub_repo.find_commit(theirs_oid)?;
-    let target_message = theirs_commit
-        .message_raw()
-        .ok_or_else(|| anyhow!("incoming commit {theirs_oid} has no UTF-8 commit message"))?
-        .to_owned();
-
     let (candidate, containing_refs) =
-        find_matching_commit(&sub_repo, ours_oid, theirs_oid, &target_message)?;
+        find_matching_commit(&sub_repo, ancestor_oid, ours_oid, theirs_oid)?;
 
     let checkout_moved = checkout_submodule(&sub_repo, candidate)?;
     stage_submodule(super_repo, submodule_path, candidate)?;
@@ -377,34 +446,73 @@ fn read_conflict_stages(
     Ok((ancestor, ours, theirs))
 }
 
-/// Walks every ref in the submodule, hiding commits reachable from either
-/// `ours_oid` or `theirs_oid`. What remains are exactly the commits introduced
-/// to reconcile one side with the other (cherry-pick, rebase, merge commit).
-/// Of those, only commits that descend from `ours_oid` are valid resolutions:
-/// the reconciliation is by definition `theirs` applied on top of `ours`, so
-/// `ours_oid` must be in the candidate's ancestry. Copies cherry-picked onto
-/// other branches (backports, stale rebases) fail this test and are rejected.
+/// Locates the reconciled submodule commit by fingerprinting the *incoming*
+/// submodule diff — i.e. what the commit being applied intends to change.
 ///
-/// Note: we intentionally do NOT filter by the stage-1 "ancestor" recorded in
-/// the superproject index. That value is the submodule SHA at the superproject
-/// merge base, which in real repos is often *not* an ancestor of `ours_oid`
-/// (e.g. when the submodule pointer was moved sideways in a later commit on
-/// the ours branch). `ours_oid` is the sharper, more reliable anchor.
+/// Workflow context: the user rebases the submodule first so its branch
+/// contains main's work plus the feature work replayed on top, then rebases
+/// the superproject. When a gitlink conflict surfaces, the *commit being
+/// applied* (stage 3, "theirs") specifies an old→new submodule ref in its
+/// diff; that old is stage 1 ("ancestor"). The commits in `ancestor..theirs`
+/// are the work this particular superproject commit intends to bring into
+/// the submodule.
 ///
-/// This also deliberately avoids trusting `.gitmodules` `branch`, which on
-/// feature branches is often wrong: both the superproject and submodule may
-/// be on alternate branches that `.gitmodules` doesn't name.
+/// Strategy:
+/// 1. Compute `target` = commit messages reachable from `theirs_oid` but not
+///    from `ancestor_oid` in the submodule DAG. This is the set of submodule
+///    commits the superproject commit being applied wants to add.
+/// 2. Find a submodule commit X such that the commits reachable from X but
+///    not from `ours_oid` carry that same multiset of messages. That is: X
+///    is the current state (`ours_oid`) with the incoming commits replayed
+///    on top — which is exactly what the pre-rebased submodule branch tip
+///    (or an interior commit in that chain) should be.
+///
+/// Using the full message list as a fingerprint is dramatically less
+/// ambiguous than matching on a single theirs message — two unrelated
+/// branches rarely share an entire sequence of commit messages, so this
+/// survives large repos with many backports and overlapping work.
+///
+/// Edge case: if `theirs_oid == ancestor_oid` (the incoming commit didn't
+/// change the submodule ref), target is empty and the answer is `ours_oid`.
+/// A genuine gitlink conflict shouldn't produce this state, but we handle
+/// it gracefully.
+///
+/// We deliberately avoid trusting `.gitmodules` `branch`, which on feature
+/// branches is often wrong: both the superproject and submodule may be on
+/// alternate branches that `.gitmodules` doesn't name.
 fn find_matching_commit(
     sub_repo: &Repository,
+    ancestor_oid: Oid,
     ours_oid: Oid,
     theirs_oid: Oid,
-    target_message: &str,
 ) -> Result<(Oid, Vec<String>)> {
+    let target = messages_between(sub_repo, ancestor_oid, theirs_oid).with_context(|| {
+        format!(
+            "could not enumerate commits between base {ancestor_oid} and theirs \
+             {theirs_oid} in submodule"
+        )
+    })?;
+    let mut target_sorted = target.clone();
+    target_sorted.sort();
+
+    if target_sorted.is_empty() {
+        // Incoming commit didn't change the submodule ref past the base; the
+        // resolved ref should just be ours.
+        let containing = refs_containing(sub_repo, ours_oid);
+        return Ok((ours_oid, containing));
+    }
+
+    let target_set: HashSet<Vec<u8>> = target.iter().cloned().collect();
+
     let seeds = collect_ref_tips(sub_repo)?;
     if seeds.is_empty() {
         bail!("submodule has no refs to search; create or fetch the branch with the merged commit");
     }
 
+    // Walk every commit reachable from a ref tip, hiding `ours_oid` and its
+    // ancestors. Cheap pre-filter: skip any commit whose own message isn't
+    // in the target set — a valid X's tip-most commit (in theirs..X) must be
+    // theirs's tip message, which is always in the target set.
     let mut revwalk = sub_repo.revwalk().context("could not create revwalk")?;
     revwalk.set_sorting(Sort::TOPOLOGICAL)?;
     for (oid, name) in &seeds {
@@ -415,51 +523,38 @@ fn find_matching_commit(
     revwalk
         .hide(ours_oid)
         .with_context(|| format!("could not hide 'ours' {ours_oid} from revwalk"))?;
-    revwalk
-        .hide(theirs_oid)
-        .with_context(|| format!("could not hide 'theirs' {theirs_oid} from revwalk"))?;
 
     let mut matches: Vec<Oid> = Vec::new();
     for oid_result in revwalk {
         let oid = oid_result?;
         let commit = sub_repo.find_commit(oid)?;
-        if commit.message_raw() == Some(target_message) {
+        let msg = commit.message_raw_bytes().to_vec();
+        if !target_set.contains(&msg) {
+            continue;
+        }
+        if !sub_repo.graph_descendant_of(oid, ours_oid).unwrap_or(false) {
+            continue;
+        }
+
+        let cand = messages_between(sub_repo, ours_oid, oid)?;
+        let mut cand_sorted = cand;
+        cand_sorted.sort();
+        if cand_sorted == target_sorted {
             matches.push(oid);
         }
     }
 
-    if matches.is_empty() {
-        bail!(
-            "no commit introduced between 'ours' and any submodule ref carries the \
-             incoming commit message (searched {} ref(s)); has the submodule side \
-             been merged yet?",
-            seeds.len()
-        );
-    }
+    matches.sort();
+    matches.dedup();
 
-    let valid: Vec<Oid> = matches
-        .iter()
-        .copied()
-        .filter(|&oid| {
-            sub_repo
-                .graph_descendant_of(oid, ours_oid)
-                .unwrap_or(false)
-        })
-        .collect();
-
-    let found = match valid.as_slice() {
+    let found = match matches.as_slice() {
         [] => {
-            let list = matches
-                .iter()
-                .map(|o| o.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
             bail!(
-                "found {} commit(s) with the incoming commit message ({list}) but none \
-                 descend from 'ours' {ours_oid}; these look like copies on other branches \
-                 (backports or stale rebases) rather than the reconciliation of 'theirs' \
-                 into 'ours'",
-                matches.len()
+                "no submodule commit descends from ours {ours_oid} whose history since \
+                 ours matches the {} commit message(s) the incoming commit introduces \
+                 (base {ancestor_oid}..theirs {theirs_oid}); has the submodule been \
+                 rebased to include the incoming commits on top of ours?",
+                target_sorted.len()
             );
         }
         [only] => *only,
@@ -470,15 +565,33 @@ fn find_matching_commit(
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!(
-                "ambiguous match: multiple submodule commits descend from 'ours' \
-                 {ours_oid} and carry the incoming commit message ({list}); \
-                 resolve manually"
+                "ambiguous match: multiple submodule commits descend from ours \
+                 {ours_oid} and carry the same commit-message list as the incoming \
+                 diff ({list}); resolve manually"
             );
         }
     };
 
     let containing = refs_containing(sub_repo, found);
     Ok((found, containing))
+}
+
+/// Commit-message bytes for every commit reachable from `include` but not from
+/// `exclude`, in revwalk order. We use raw bytes (not str) so commits with
+/// non-UTF-8 messages still compare correctly.
+fn messages_between(repo: &Repository, exclude: Oid, include: Oid) -> Result<Vec<Vec<u8>>> {
+    let mut walk = repo.revwalk().context("could not create revwalk")?;
+    walk.push(include)
+        .with_context(|| format!("could not push {include} into revwalk"))?;
+    walk.hide(exclude)
+        .with_context(|| format!("could not hide {exclude} from revwalk"))?;
+    let mut msgs = Vec::new();
+    for oid in walk {
+        let oid = oid?;
+        let commit = repo.find_commit(oid)?;
+        msgs.push(commit.message_raw_bytes().to_vec());
+    }
+    Ok(msgs)
 }
 
 /// Returns (oid, ref-name) for every local branch, remote-tracking branch, and

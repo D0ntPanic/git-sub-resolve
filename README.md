@@ -44,8 +44,9 @@ superproject index.
 
 ## What it won't do
 
-- It does not continue the rebase or merge. After the gitlink is staged you can
-  review with `git diff --cached -- <path>` and then continue on your own.
+- By default it does not continue the rebase or merge. After the gitlink is
+  staged you can review with `git diff --cached -- <path>` and then continue on
+  your own. (See `--all` below for opt-in auto-continuation.)
 - It does not handle reconciliations done via a real merge commit in the
   submodule (where the merge commit has a `Merge branch...` message rather
   than the incoming commit's message). Only cherry-pick / rebase style
@@ -90,6 +91,52 @@ Review with: git diff --cached -- api
 This tool did not continue the merge/rebase; do so yourself when ready.
 ```
 
+### Batch mode: `--all`
+
+```
+git sub-resolve --all
+```
+
+Resolves *every* submodule gitlink conflict in the current index and then
+continues the in-progress merge, rebase, cherry-pick, revert, or `git am`. If a
+new conflict surfaces on the next commit in the sequence, the process repeats
+until the operation finishes.
+
+Preconditions and guarantees:
+
+- Before touching anything, `--all` scans the index and errors out if *any*
+  conflict is not a submodule gitlink. Regular file conflicts must be resolved
+  by hand first — `--all` will not proceed past them.
+- After resolving all reported submodule conflicts, the index is re-read and
+  must be conflict-free before the tool continues the operation.
+- The underlying per-submodule resolution is the same logic described above, so
+  ambiguous or unfetched submodule cases still abort cleanly without staging
+  anything.
+- The continuation step shells out to `git <op> --continue` with
+  `GIT_EDITOR=true` so no editor is opened for the commit message. The merge
+  commit message is whatever git would have produced non-interactively.
+
+Example output for a rebase with two conflicting commits, each of which touches
+the same submodule:
+
+```
+[1] resolving 1 submodule conflict(s)...
+  api: staged 0090c43ce962 (theirs 2ece495f9ce7)
+[1] running `git rebase --continue`...
+[Detached HEAD a1b2c3d] ...
+[2] resolving 1 submodule conflict(s)...
+  api: staged def6789abcde (theirs aabbccdd1122)
+[2] running `git rebase --continue`...
+Merge complete.
+```
+
+If a non-submodule conflict is present, `--all` aborts immediately:
+
+```
+git sub-resolve: conflict at 'src/foo.rs' is not a submodule (index mode 100644);
+--all only resolves submodule (gitlink) conflicts
+```
+
 ## Failure modes
 
 The tool exits non-zero without mutating anything when it can't identify a
@@ -110,6 +157,20 @@ unique resolution. Common diagnostics:
   — submodule has uncommitted changes; commit or stash them and retry. The
   superproject index is left untouched in this case.
 
+Additional diagnostics specific to `--all`:
+
+- `no merge/rebase/cherry-pick in progress` — there's nothing for `--all` to
+  continue.
+- `conflict at '<path>' is not a submodule (index mode <mode>)` — a
+  non-submodule file is conflicted; resolve it manually, then rerun.
+- `conflicts remain after resolving all reported submodules` — the tool
+  resolved every submodule it saw but the index still reports conflicts. This
+  shouldn't happen in practice; rerun manually to investigate.
+- ``git <op> --continue` exited with <status> and no conflicts were introduced``
+  — the continuation step failed for some reason other than a new conflict
+  (e.g. empty commit, sequencer refusal). Rerun the command by hand to see the
+  underlying error.
+
 ## Safety
 
 - The submodule working-tree checkout happens *before* the superproject index
@@ -118,4 +179,6 @@ unique resolution. Common diagnostics:
 - The submodule checkout is "safe" mode — libgit2 refuses to overwrite
   modified files.
 - A review step (`git diff --cached -- <path>`) is always possible because the
-  tool stops after staging; nothing is committed automatically.
+  tool stops after staging; nothing is committed automatically. Note that
+  `--all` opts *out* of this — it commits the merge/rebase step once conflicts
+  are resolved.

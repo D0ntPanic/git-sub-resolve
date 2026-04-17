@@ -1,9 +1,10 @@
 use anyhow::{anyhow, bail, Context, Result};
 use git2::build::CheckoutBuilder;
-use git2::{IndexEntry, IndexTime, Oid, Repository, Sort};
+use git2::{Index, IndexEntry, IndexTime, Oid, Repository, RepositoryState, Sort};
+use std::collections::HashSet;
 use std::env;
 use std::path::Path;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 const GITLINK_MODE: u32 = 0o160000;
 
@@ -17,20 +18,37 @@ fn main() -> ExitCode {
     }
 }
 
+fn print_usage() {
+    eprintln!("Usage: git sub-resolve <path-to-submodule>");
+    eprintln!("       git sub-resolve --all");
+    eprintln!();
+    eprintln!("Resolves a submodule merge conflict by locating the already-merged");
+    eprintln!("commit in the submodule (matched by commit message) and staging it");
+    eprintln!("in the superproject index.");
+    eprintln!();
+    eprintln!("With --all, resolves every submodule conflict in the current index,");
+    eprintln!("aborting immediately if any non-submodule conflict is present, then");
+    eprintln!("continues the in-progress merge/rebase/cherry-pick. Repeats until the");
+    eprintln!("operation finishes or a non-submodule conflict appears.");
+}
+
 fn run() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 2 || matches!(args[1].as_str(), "-h" | "--help") {
-        eprintln!("Usage: git sub-resolve <path-to-submodule>");
-        eprintln!();
-        eprintln!("Resolves a submodule merge conflict by locating the already-merged");
-        eprintln!("commit in the submodule (matched by commit message) and staging it");
-        eprintln!("in the superproject index. Does not continue the rebase/merge.");
-        if args.len() == 2 {
-            return Ok(());
-        }
+    if args.len() != 2 {
+        print_usage();
         bail!("invalid arguments");
     }
-    let raw_path = &args[1];
+    match args[1].as_str() {
+        "-h" | "--help" => {
+            print_usage();
+            Ok(())
+        }
+        "--all" => run_all(),
+        path => run_single(path),
+    }
+}
+
+fn run_single(raw_path: &str) -> Result<()> {
     let submodule_path = raw_path.trim_end_matches('/');
 
     let super_repo = Repository::discover(".")
@@ -40,8 +58,121 @@ fn run() -> Result<()> {
         bail!("superproject is bare; sub-resolve requires a working tree");
     }
 
+    let outcome = resolve_submodule(&super_repo, submodule_path)?;
+
+    println!(
+        "Resolved submodule '{submodule_path}':\n  \
+         base    {}\n  \
+         ours    {}\n  \
+         theirs  {}\n  \
+         staged  {}",
+        outcome.ancestor_oid, outcome.ours_oid, outcome.theirs_oid, outcome.staged
+    );
+    if !outcome.containing_refs.is_empty() {
+        println!("Candidate is reachable from:");
+        for name in &outcome.containing_refs {
+            println!("  {name}");
+        }
+    }
+    if outcome.checkout_moved {
+        println!(
+            "Submodule working tree checked out at {} (detached HEAD).",
+            outcome.staged
+        );
+    } else {
+        println!(
+            "Submodule working tree already at {}; left HEAD as-is.",
+            outcome.staged
+        );
+    }
+    println!();
+    println!("Review with: git diff --cached -- {submodule_path}");
+    println!("This tool did not continue the merge/rebase; do so yourself when ready.");
+
+    Ok(())
+}
+
+fn run_all() -> Result<()> {
+    let super_repo = Repository::discover(".").context("not inside a git repository")?;
+    if super_repo.is_bare() {
+        bail!("superproject is bare; sub-resolve requires a working tree");
+    }
+    if super_repo.state() == RepositoryState::Clean {
+        bail!("no merge/rebase/cherry-pick in progress");
+    }
+
+    let mut iteration = 0;
+    loop {
+        iteration += 1;
+
+        let mut index = super_repo
+            .index()
+            .context("could not read superproject index")?;
+        index
+            .read(true)
+            .context("could not reload superproject index from disk")?;
+
+        if index.has_conflicts() {
+            // Verify every conflict is a submodule gitlink before touching anything.
+            let paths = collect_submodule_conflict_paths(&index)?;
+            drop(index);
+
+            println!(
+                "[{iteration}] resolving {} submodule conflict(s)...",
+                paths.len()
+            );
+            for path in &paths {
+                let outcome = resolve_submodule(&super_repo, path)?;
+                println!(
+                    "  {path}: staged {} (theirs {})",
+                    short_oid(outcome.staged),
+                    short_oid(outcome.theirs_oid),
+                );
+            }
+
+            let mut fresh = super_repo
+                .index()
+                .context("could not re-read superproject index")?;
+            fresh
+                .read(true)
+                .context("could not reload superproject index from disk")?;
+            if fresh.has_conflicts() {
+                bail!(
+                    "conflicts remain after resolving all reported submodules; \
+                     aborting before continuing the merge"
+                );
+            }
+        }
+
+        let state = super_repo.state();
+        if state == RepositoryState::Clean {
+            println!("Merge complete.");
+            return Ok(());
+        }
+
+        let op = state_to_op(state)?;
+        println!("[{iteration}] running `git {op} --continue`...");
+        continue_operation(&super_repo, op)?;
+
+        if super_repo.state() == RepositoryState::Clean {
+            println!("Merge complete.");
+            return Ok(());
+        }
+    }
+}
+
+struct ResolutionOutcome {
+    ancestor_oid: Oid,
+    ours_oid: Oid,
+    theirs_oid: Oid,
+    staged: Oid,
+    containing_refs: Vec<String>,
+    checkout_moved: bool,
+}
+
+fn resolve_submodule(super_repo: &Repository, submodule_path: &str) -> Result<ResolutionOutcome> {
     let (ancestor_oid, ours_oid, theirs_oid) =
-        read_conflict_stages(&super_repo, submodule_path)?;
+        read_conflict_stages(super_repo, submodule_path)?;
 
     let sub_repo = super_repo
         .find_submodule(submodule_path)
@@ -74,37 +205,116 @@ fn run() -> Result<()> {
         .ok_or_else(|| anyhow!("incoming commit {theirs_oid} has no UTF-8 commit message"))?
         .to_owned();
 
-    let (candidate, containing_refs) = find_matching_commit(
-        &sub_repo,
-        ours_oid,
-        theirs_oid,
-        &target_message,
-    )?;
+    let (candidate, containing_refs) =
+        find_matching_commit(&sub_repo, ours_oid, theirs_oid, &target_message)?;
 
     let checkout_moved = checkout_submodule(&sub_repo, candidate)?;
-    stage_submodule(&super_repo, submodule_path, candidate)?;
+    stage_submodule(super_repo, submodule_path, candidate)?;
 
-    println!(
-        "Resolved submodule '{submodule_path}':\n  \
-         base    {ancestor_oid}\n  \
-         ours    {ours_oid}\n  \
-         theirs  {theirs_oid}\n  \
-         staged  {candidate}"
-    );
-    if !containing_refs.is_empty() {
-        println!("Candidate is reachable from:");
-        for name in &containing_refs {
-            println!("  {name}");
+    Ok(ResolutionOutcome {
+        ancestor_oid,
+        ours_oid,
+        theirs_oid,
+        staged: candidate,
+        containing_refs,
+        checkout_moved,
+    })
+}
+
+fn short_oid(oid: Oid) -> String {
+    let s = oid.to_string();
+    s[..s.len().min(12)].to_string()
+}
+
+/// Returns the unique paths of conflicted index entries, bailing as soon as we
+/// see one whose mode isn't a gitlink. This is what lets `--all` refuse to touch
+/// anything unless every conflict is a submodule pointer.
+fn collect_submodule_conflict_paths(index: &Index) -> Result<Vec<String>> {
+    let mut paths: Vec<String> = Vec::new();
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+
+    let conflicts = index
+        .conflicts()
+        .context("could not iterate index conflicts")?;
+    for conflict in conflicts {
+        let conflict = conflict?;
+
+        let mut path_bytes: Option<Vec<u8>> = None;
+        for entry in [&conflict.ancestor, &conflict.our, &conflict.their]
+            .iter()
+            .filter_map(|e| e.as_ref())
+        {
+            if entry.mode != GITLINK_MODE {
+                let p = String::from_utf8_lossy(&entry.path);
+                bail!(
+                    "conflict at '{p}' is not a submodule (index mode {:o}); \
+                     --all only resolves submodule (gitlink) conflicts",
+                    entry.mode
+                );
+            }
+            if path_bytes.is_none() {
+                path_bytes = Some(entry.path.clone());
+            }
+        }
+
+        if let Some(pb) = path_bytes {
+            if seen.insert(pb.clone()) {
+                let p = std::str::from_utf8(&pb)
+                    .context("conflict path is not valid UTF-8")?
+                    .to_string();
+                paths.push(p);
+            }
         }
     }
-    if checkout_moved {
-        println!("Submodule working tree checked out at {candidate} (detached HEAD).");
-    } else {
-        println!("Submodule working tree already at {candidate}; left HEAD as-is.");
+
+    Ok(paths)
+}
+
+fn state_to_op(state: RepositoryState) -> Result<&'static str> {
+    Ok(match state {
+        RepositoryState::Merge => "merge",
+        RepositoryState::CherryPick | RepositoryState::CherryPickSequence => "cherry-pick",
+        RepositoryState::Rebase
+        | RepositoryState::RebaseInteractive
+        | RepositoryState::RebaseMerge => "rebase",
+        RepositoryState::Revert | RepositoryState::RevertSequence => "revert",
+        RepositoryState::ApplyMailbox | RepositoryState::ApplyMailboxOrRebase => "am",
+        RepositoryState::Clean => bail!("repository is clean; no operation to continue"),
+        RepositoryState::Bisect => {
+            bail!("repository is in bisect; sub-resolve --all cannot continue a bisect")
+        }
+    })
+}
+
+/// Invokes `git <op> --continue`. A non-zero exit is tolerated *only* when the
+/// next step in a sequence (rebase/cherry-pick/revert/am) hit a new conflict;
+/// the caller's loop picks that up on the next pass. Any other failure aborts.
+fn continue_operation(super_repo: &Repository, op: &str) -> Result<()> {
+    let workdir = super_repo
+        .workdir()
+        .ok_or_else(|| anyhow!("repository has no working directory"))?;
+
+    let status = Command::new("git")
+        .args([op, "--continue"])
+        .current_dir(workdir)
+        .env("GIT_EDITOR", "true")
+        .status()
+        .with_context(|| format!("failed to invoke `git {op} --continue`"))?;
+
+    if !status.success() {
+        let mut index = super_repo
+            .index()
+            .context("could not read index after continue")?;
+        index
+            .read(true)
+            .context("could not reload index after continue")?;
+        if !index.has_conflicts() {
+            bail!(
+                "`git {op} --continue` exited with {status} and no conflicts were \
+                 introduced; rerun the command manually to see the underlying error"
+            );
+        }
     }
-    println!();
-    println!("Review with: git diff --cached -- {submodule_path}");
-    println!("This tool did not continue the merge/rebase; do so yourself when ready.");
 
     Ok(())
 }

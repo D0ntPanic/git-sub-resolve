@@ -1,0 +1,18 @@
+[package]
+name = "git-sub-resolve"
+version = "0.1.0"
+edition = "2021"
+description = "Git extension to resolve submodule merge conflicts by matching commit messages"
+license = "MIT"
+
+[[bin]]
+name = "git-sub-resolve"
+path = "src/main.rs"
+
+[dependencies]
+git2 = "0.19"
+anyhow = "1"
+
+[profile.release]
+lto = true
+strip = true
